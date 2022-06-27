@@ -15,4 +15,10 @@ Modded Edifier R1280T to change volume with Samsung or any other remote. I used 
 
 ## Comments
 
-You will need a separate AC to 5V power supply for the ESP8266 because the onboard regulators can't handle it.
+You will need a separate AC to 5V power supply for the ESP32 because the onboard regulators can't handle it.
+Current setup supports AA,BB,CC,DD commands form the tv remote. For example command AD is a specific number,
+published in mqtt topic as json:
+```
+Topic: home/livingroom/tvspeakers/command
+{"command":13}
+```
