@@ -1,10 +1,9 @@
 #include <Arduino.h>
 #include <IRremoteESP8266.h>
-#include <ESP8266WiFi.h>
 #include <IRrecv.h>
 #include <IRutils.h>
 #include "Wire.h"
-#include <PubSubClient.h>
+#include "EspMQTTClient.h"
 #include <Ticker.h> 
 #include <ArduinoJson.h>
 #include "SSD1306.h"  
@@ -12,7 +11,7 @@
 
 SSD1306 display(0x3c, SDA, SCL);
 unsigned long lastDisplayResetMillis = 0;
-uint16_t displayTimeout = 10000; //millis
+uint16_t displayTimeout = 5000; //millis
 
 ICACHE_RAM_ATTR
 
@@ -30,32 +29,35 @@ ICACHE_RAM_ATTR
 #define COM_3_IR_CODE 3772803223
 
 
-WiFiClient espClient;
-PubSubClient client(espClient);
 uint8_t clientUpdateEveryMillis = 100;
 unsigned long clientLastMillis = 0;
 
-const char* ssid = "XXX"; // Enter your WiFi name
-const char* password =  "XXX"; // Enter WiFi password
-const char* mqttServer = "XXX";
-const int mqttPort = 1883;
-const char* mqttUser = "mqtt_node";
-const char* mqttPassword = "XXX";
+EspMQTTClient client(
+  "xxx",
+  "xxx",
+  "xxx",  // MQTT Broker server ip
+  "xxx",   // Can be omitted if not needed
+  "xxx",   // Can be omitted if not needed
+  "TVSpeakers"      // Client name that uniquely identify your device
+);
 
 Ticker publishTimer;
 Ticker checkConnectionTimer;
 
-const uint16_t kRecvPin = 14;
+const uint16_t kRecvPin = 13;
 
 uint16_t autoPublishTimerSeconds = 60;
 IRrecv irrecv(kRecvPin);
 decode_results results;
 uint8_t master_volume = 60; //-26bB
-bool muted = false;
+bool isMuted = false;
 bool stateChanged = false;
-bool wifiOK = false;
-bool mqttOk = false;
 bool isDiplayOn = true;
+int8_t command = -1;
+uint16_t commandTimeOut = 1000; //millis
+unsigned long commandPressTS = 0;
+bool showCommand;
+int8_t lastCommand;
 void volumeUp();
 void volumeDown();
 void volumeMute();
@@ -71,47 +73,64 @@ void displaySplash();
 void resetDisplayTimeout();
 void setDisplayBlack();
 void irLoop();
+void commandLoop();
+void commandHandler(int8_t com);
+void displayTimeoutLoop();
 
-void setup() {
+void setup() {  
   delay(1000);
-  Serial.begin(115200);
+  Serial.begin(115200);  
   Wire.begin();
   irrecv.enableIRIn();  // Start the receiver
   while (!Serial)  // Wait for the serial connection to be establised.
     delay(50);
+  Serial.println("Setup begin");
   delay(200);
   if(!display.init()) Serial.println("Oled failed");
   delay(500);
   displaySplash();
   ampInit();
-  delay(400);  
-  client.setServer(mqttServer, mqttPort);
-  client.setCallback(mqttCallback);
-  checkConnection();  
-  client.subscribe(MQTT_TOPIC_CONFIG);
+  delay(1200);    
+  client.enableDebuggingMessages(); // Enable debugging messages sent to serial output
+  client.enableHTTPWebUpdater(); // Enable the web updater. User and password default to values of MQTTUsername and MQTTPassword. These can be overridded with enableHTTPWebUpdater("user", "password").
+  client.enableOTA(); // Enable OTA (Over The Air) updates. Password defaults to MQTTPassword. Port is the default OTA port. Can be overridden with enableOTA("password", port).
+  client.enableLastWillMessage("TVSpeakers/lastwill", "I am going offline");  // You can activate the retain flag by setting the third parameter to true  
   delay(200);
   publishTimer.attach(autoPublishTimerSeconds, publishState);
-  checkConnectionTimer.attach(autoPublishTimerSeconds/2, checkConnection);
   delay(200);  
-  setVolumeLevel(master_volume);
+  setVolumeLevel(master_volume);  
+  Serial.println("Setup end");
 }
 
-void loop() {
+void loop() {  
   irLoop();
 
-  if((unsigned long) millis() - clientLastMillis > clientUpdateEveryMillis){
-    client.loop();
-    clientLastMillis = millis();
-  }  
-  
-  if(isDiplayOn && ((unsigned long) millis() - lastDisplayResetMillis > displayTimeout)){
-    setDisplayBlack();
-  }  
-  
+  client.loop();
+
+  commandLoop();
+
+  displayTimeoutLoop();  
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) { 
-  
+void onConnectionEstablished()
+{
+  client.subscribe(MQTT_TOPIC_CONFIG, [](const String & payload) {
+    Serial.print(F("Message arrived in topic: "));  Serial.println(MQTT_TOPIC_CONFIG); 
+    Serial.print(F("Message:"));
+    Serial.println(payload);
+    Serial.println(F("-----------------------")); 
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, payload);
+    bool volUp = doc["volUp"];
+    bool volDown = doc["volDown"];
+    bool mute = doc["mute"];
+    if(volUp) volumeUp();
+    if(volDown) volumeDown();
+    if(mute) volumeMute();
+  });
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {   
   Serial.print(F("Message arrived in topic: "));  Serial.println(topic); 
   Serial.print(F("Message:"));
   for (int i = 0; i < length; i++) {
@@ -130,11 +149,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void publishState(){
-  if(stateChanged){
+  if(stateChanged && client.isMqttConnected()){
     stateChanged = false;
     DynamicJsonDocument doc(256);
     doc["volume"] = getUserVolume();
-    doc["muted"] = muted;
+    doc["muted"] = isMuted;
     char jsonBuffer[256];
     serializeJson(doc, jsonBuffer);
     Serial.print(F("Publishing state:"));
@@ -151,74 +170,31 @@ void publishCommand(uint8_t com){
   Serial.print(F("Publishing command:"));
   Serial.println(jsonBuffer);
   client.publish(MQTT_TOPIC_COMMAND, jsonBuffer); //Topic name
-}
-
-void checkConnection(){
-  Serial.println(F("Checking connection"));
-  uint8_t cnt = 0;
-  if(WiFi.status() != WL_CONNECTED) {
-    WiFi.disconnect();
-    WiFi.begin(ssid, password);
-    WiFi.mode(WIFI_STA);
-    while (WiFi.status() != WL_CONNECTED && cnt < 25) {
-      delay(500);
-      Serial.println(F("Connecting to WiFi.."));
-      cnt++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiOK = true;
-      Serial.println(F("Connected to the WiFi network"));
-    }
-    else {
-      Serial.println(F("WiFi connection failed"));
-      wifiOK = false;
-    }
-  } else{
-    Serial.println(F("Wifi seems OK")); 
-    wifiOK = true;
-  }
-  cnt = 0;
-  if(client.state() != MQTT_CONNECTED){
-    while (client.state() != MQTT_CONNECTED && cnt < 2) {
-      Serial.println(F("Connecting to MQTT..."));   
-      if (client.connect("TVSpeakers", mqttUser, mqttPassword )) {   
-        Serial.println(F("connected"));     
-        mqttOk = true;
-      } else {   
-        Serial.print(F("failed with state "));
-        Serial.println(client.state());
-        delay(2000);   
-        mqttOk = false;
-      }
-      cnt++;
-    }
-  }else {
-    Serial.println("MQTT seems OK"); 
-    mqttOk = true;
-  }
-  //updateScreen();
+  lastCommand = com;
+  showCommand = true;
+  updateScreen();  
 }
 
 void volumeUp(){  
   if(master_volume > 0) master_volume -= getVolStepSize();  
   setVolumeLevel(master_volume);
-  muted = false;
+  isMuted = false;
 }
 
 void volumeDown(){  
-  if(master_volume < 100) master_volume += getVolStepSize();
-  if(master_volume >= 100) master_volume = 100;
+  if(master_volume < 150) master_volume += getVolStepSize();
+  if(master_volume >= 150) master_volume = 150;
   setVolumeLevel(master_volume);
-  muted = false;  
+  isMuted = false;  
 }
 
 void volumeMute(){
-  if(muted){
-    muted = false;
+  if(isMuted){
+    isMuted = false;
     setVolumeLevel(master_volume);    
   }
   else {
-    muted = true;
+    isMuted = true;
     setVolumeLevel(255);
   }  
 }
@@ -240,7 +216,7 @@ void setVolumeLevel(uint8_t vol){
   Serial.print("Volume: ");
   Serial.println(getUserVolume());
   Serial.print("Mute: ");
-  if(muted)Serial.println("ON");
+  if(isMuted)Serial.println("ON");
   else Serial.println("OFF");
   Wire.beginTransmission(AMPLIFIER_I2C_ADDRES_DEC);
   Wire.write(AMPLIFIER_I2C_MV_REGISTER);
@@ -259,18 +235,23 @@ uint8_t getVolStepSize(){
 
 void updateScreen(){  
   display.clear();
-  if(muted){
+  if(isMuted){
     display.drawXbm(40, 0, 50, 50, epd_bitmap_mute_icon);
+  }else if(showCommand){
+    display.setFont(Roboto_40);
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.drawString(64, 0, "#" + String(lastCommand) + "#");
+    showCommand = false;
   }else{
     display.setFont(Roboto_40);
     display.setTextAlignment(TEXT_ALIGN_CENTER);
     display.drawString(64, 0, String(getUserVolume()));
   }
 
-  if(mqttOk) display.drawXbm(0, 49, 15, 15, epd_bitmap_mqtt_ok_icon);
+  if(client.isMqttConnected()) display.drawXbm(0, 49, 15, 15, epd_bitmap_mqtt_ok_icon);
   else display.drawXbm(0, 49, 15, 15, epd_bitmap_mqtt_failed_icon);
 
-  if(wifiOK) display.drawXbm(113, 49, 15, 15, epd_bitmap_wifi_on_icon);
+  if(client.isWifiConnected()) display.drawXbm(113, 49, 15, 15, epd_bitmap_wifi_on_icon);
   else display.drawXbm(113, 49, 15, 15, epd_bitmap_wifi_off_icon);
   // write the buffer to the display
   display.display();
@@ -289,7 +270,7 @@ void displaySplash(){
 }
 
 uint8_t getUserVolume(){
-  uint8_t dv = ((100 - master_volume)/2);
+  uint8_t dv = ((150 - master_volume)/2);
   return dv;
 }
 
@@ -315,15 +296,46 @@ void irLoop(){
     B: 3772786903 //COM1
     C: 3772819543 //COM2
     D: 3772803223 //COM3
-    */     
-       
+    */         
     if(results.value == 3772833823) volumeUp();
     else if(results.value == 3772829743) volumeDown();
-    else if(results.value == 3772837903) volumeMute();
-    else if(results.value == COM_0_IR_CODE) publishCommand(0);
-    else if(results.value == COM_1_IR_CODE) publishCommand(1);
-    else if(results.value == COM_2_IR_CODE) publishCommand(2);
-    else if(results.value == COM_3_IR_CODE) publishCommand(3);
+    else if(results.value == 3772837903) volumeMute();    
+
+    if(results.value == COM_0_IR_CODE) commandHandler(0);
+    else if(results.value == COM_1_IR_CODE) commandHandler(1);
+    else if(results.value == COM_2_IR_CODE) commandHandler(2);
+    else if(results.value == COM_3_IR_CODE) commandHandler(3);
+    
     irrecv.resume();  // Receive the next value
   }
+}
+
+void commandHandler(int8_t com){
+  if(command >=0) {
+    if((unsigned long) millis() - commandPressTS > 200){
+      publishCommand(10*(command+1) + com);
+      commandPressTS = millis();
+      command = -1;
+    }    
+  }
+  else{
+    if((unsigned long) millis() - commandPressTS > 200){
+      commandPressTS = millis();
+      command = com;
+    }
+}
+}
+
+void commandLoop(){
+  if(command >=0 && (unsigned long) millis() - commandPressTS > commandTimeOut){
+    publishCommand(command);
+    commandPressTS = millis();
+    command = -1;
+  }
+}
+
+void displayTimeoutLoop(){  
+  if(!isMuted && isDiplayOn && ((unsigned long) millis() - lastDisplayResetMillis > displayTimeout)){
+    setDisplayBlack();
+  }    
 }
